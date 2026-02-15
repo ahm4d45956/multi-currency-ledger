@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS accounts (
+    id SERIAL PRIMARY KEY,
+    user_id VARCHAR(255) NOT NULL,
+    currency VARCHAR(10) NOT NULL,
+    balance NUMERIC NOT NULL DEFAULT 0
+);

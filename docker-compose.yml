@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+
+  ledger-service:
+    build: ./ledger-service
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - fx-service
+      - revenue-service
+
+  fx-service:
+    build: ./fx-service
+    ports:
+      - "8001:8001"
+
+  revenue-service:
+    build: ./revenue-service
+    ports:
+      - "8002:8002"
+
+  postgres:
+    image: postgres:14
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ledger
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./ledger-service/init.sql:/docker-entrypoint-initdb.d/init.sql
