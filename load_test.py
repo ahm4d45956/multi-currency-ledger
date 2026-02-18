@@ -7,12 +7,14 @@ BASE_URL = "http://localhost:8000"
 
 
 def deposit(account_id, amount):
-    r = requests.post(
+    response = requests.post(
         f"{BASE_URL}/deposit",
-        json={"account_id": account_id, "amount": amount}
+        json={
+            "account_id": account_id,
+            "amount": float(amount)
+        }
     )
-    if r.status_code != 200:
-        print("Error:", r.text)
+    return response
 
 
 def run_test():
@@ -21,7 +23,7 @@ def run_test():
     response = requests.post(
         f"{BASE_URL}/accounts",
         json={
-            "user_id": "load_test_user",
+            "user_id": 1,
             "currency": "USD"
         }
     )
@@ -35,43 +37,45 @@ def run_test():
 
     requests.post(
         f"{BASE_URL}/deposit",
-        json={"account_id": account_id, "amount": 1000}
+        json={
+            "account_id": account_id,
+            "amount": 1000
+        }
     )
-
-    threads = []
-    start = time.time()
 
     print("Running 100 concurrent deposits...")
 
+    threads = []
+    start_time = time.time()
+
     for _ in range(100):
-        t = threading.Thread(
-            target=deposit,
-            args=(account_id, 1)
-        )
+        t = threading.Thread(target=deposit, args=(account_id, 1))
         threads.append(t)
         t.start()
 
     for t in threads:
         t.join()
 
-    end = time.time()
+    end_time = time.time()
 
-    # Fetch final balance
-    response = requests.get(f"{BASE_URL}/accounts/{account_id}")
+    response = requests.get(f"{BASE_URL}/balance/{account_id}")
+
+    print("Final balance status:", response.status_code)
+    print("Final balance raw:", response.text)
+
     final_balance = Decimal(response.json()["balance"])
     expected = Decimal("1100")
 
     print("\nLoad test completed.")
-    print("Total time:", round(end - start, 3), "seconds")
-    print("Final balance:", final_balance)
+    print("Total time:", round(end_time - start_time, 3), "seconds")
     print("Expected balance:", expected)
+    print("Final balance:", final_balance)
 
-    if final_balance != expected:
-        print("❌ Race condition detected")
+    if final_balance == expected:
+        print("SUCCESS: No race condition detected.")
     else:
-        print("✅ Concurrency safe")
+        print("FAILURE: Race condition detected.")
 
 
 if __name__ == "__main__":
     run_test()
-

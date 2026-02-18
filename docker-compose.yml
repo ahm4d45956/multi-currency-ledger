@@ -6,6 +6,8 @@ services:
     build: ./ledger-service
     ports:
       - "8000:8000"
+    env_file:
+      - .env  
     depends_on:
       - postgres
       - fx-service

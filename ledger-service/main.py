@@ -1,53 +1,38 @@
-from fastapi import FastAPI
+import os
+import logging
+from decimal import Decimal
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import psycopg2
-from decimal import Decimal
-import logging
-import json
-import time
+from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Logging config
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# ---------------------------
-# Database Configuration
-# ---------------------------
-
+# Database configuration from environment
 DB_CONFIG = {
-    "host": "postgres",
-    "dbname": "ledger",
-    "user": "postgres",
-    "password": "postgres",
-    "port": 5432
+    "host": os.getenv("DB_HOST", "postgres"),
+    "port": os.getenv("DB_PORT", 5432),
+    "dbname": os.getenv("DB_NAME", "ledger"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD", "postgres"),
 }
 
-
-def get_connection():
-    return psycopg2.connect(**DB_CONFIG)
-
-
-# ---------------------------
-# Structured Logging
-# ---------------------------
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ledger-service")
-
-
-def log_event(event_type: str, data: dict):
-    log_entry = {
-        "event": event_type,
-        "timestamp": time.time(),
-        **data
-    }
-    logger.info(json.dumps(log_entry))
-
-
-# ---------------------------
-# Request Models
-# ---------------------------
+# ---------- Models ----------
 
 class CreateAccountRequest(BaseModel):
-    user_id: str
+    user_id: int
     currency: str
 
 
@@ -55,22 +40,53 @@ class DepositRequest(BaseModel):
     account_id: int
     amount: Decimal
 
+class TransferRequest(BaseModel):
+    from_account_id: int
+    to_account_id: int
+    amount: Decimal   
 
-# ---------------------------
-# Endpoints
-# ---------------------------
+
+# ---------- Global Exception Handler ----------
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error"}
+    )
+
+
+# ---------- DB Connection ----------
+
+def get_connection():
+    try:
+        return psycopg2.connect(**DB_CONFIG)
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        raise HTTPException(status_code=500, detail="Database unavailable")
+
+
+# ---------- Health Check ----------
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ---------- Create Account ----------
 
 @app.post("/accounts")
 def create_account(data: CreateAccountRequest):
-    conn = get_connection()
-    cur = conn.cursor()
-
     try:
+        conn = get_connection()
+        cur = conn.cursor()
+
         cur.execute(
             """
             INSERT INTO accounts (user_id, currency, balance)
             VALUES (%s, %s, %s)
-            RETURNING id;
+            RETURNING id
             """,
             (data.user_id, data.currency, Decimal("0.00"))
         )
@@ -78,100 +94,156 @@ def create_account(data: CreateAccountRequest):
         account_id = cur.fetchone()[0]
         conn.commit()
 
-        log_event("account_created", {
-            "account_id": account_id,
-            "user_id": data.user_id,
-            "currency": data.currency
-        })
-
-        return {"account_id": account_id}
-
-    finally:
         cur.close()
         conn.close()
 
+        logger.info(f"Account created: {account_id}")
+
+        return {"account_id": account_id}
+
+    except Exception as e:
+        logger.error(f"Create account failed: {e}")
+        raise HTTPException(status_code=500, detail="Account creation failed")
+
+
+# ---------- Deposit (ACID Safe) ----------
 
 @app.post("/deposit")
 def deposit(data: DepositRequest):
-    conn = get_connection()
-    cur = conn.cursor()
-
     try:
-        # Row-level locking
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # Lock row for safe concurrent updates
         cur.execute(
-            "SELECT balance FROM accounts WHERE id = %s FOR UPDATE;",
+            "SELECT balance FROM accounts WHERE id = %s FOR UPDATE",
             (data.account_id,)
         )
 
         row = cur.fetchone()
+
         if not row:
-            return {"error": "Account not found"}
+            raise HTTPException(status_code=404, detail="Account not found")
 
         current_balance = row[0]
-        amount = Decimal(str(data.amount))
-        new_balance = current_balance + amount
+        new_balance = current_balance + data.amount
 
         cur.execute(
-            "UPDATE accounts SET balance = %s WHERE id = %s;",
+            "UPDATE accounts SET balance = %s WHERE id = %s",
             (new_balance, data.account_id)
         )
 
         conn.commit()
 
-        log_event("deposit", {
-            "account_id": data.account_id,
-            "amount": str(amount),
-            "new_balance": str(new_balance)
-        })
+        cur.close()
+        conn.close()
+
+        logger.info(
+            f"Deposit successful: account={data.account_id}, amount={data.amount}"
+        )
 
         return {"new_balance": str(new_balance)}
 
-    finally:
-        cur.close()
-        conn.close()
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Deposit failed: {e}")
+        raise HTTPException(status_code=500, detail="Transaction failed")
+#------------------Transfer-------------------
 
 
-@app.get("/accounts/{account_id}")
-def get_account(account_id: int):
+@app.post("/transfer")
+def transfer(data: TransferRequest):
+    if data.amount <= 0:
+        raise HTTPException(status_code=400, detail="Transfer amount must be positive")
+
     conn = get_connection()
-    cur = conn.cursor()
-
     try:
-        cur.execute(
-            "SELECT id, user_id, currency, balance FROM accounts WHERE id = %s;",
-            (account_id,)
-        )
-        row = cur.fetchone()
+        conn.autocommit = False
+        cur = conn.cursor()
 
-        if not row:
-            return {"error": "Account not found"}
+# Always lock in ID order to avoid deadlocks
+        first_id = min(data.from_account_id, data.to_account_id)
+        second_id = max(data.from_account_id, data.to_account_id)
+
+        cur.execute(
+            "SELECT id, balance FROM accounts WHERE id IN (%s, %s) FOR UPDATE",
+            (first_id, second_id)
+        )
+
+        rows = cur.fetchall()
+
+        if len(rows) != 2:
+            raise HTTPException(status_code=404, detail="One or both accounts not found")
+
+        balances = {row[0]: row[1] for row in rows}
+
+        from_balance = balances.get(data.from_account_id)
+        to_balance = balances.get(data.to_account_id)
+
+        if from_balance is None or to_balance is None:
+            raise HTTPException(status_code=404, detail="Account mismatch")
+
+        if from_balance < data.amount:
+            raise HTTPException(status_code=400, detail="Insufficient funds")
+
+        new_from_balance = from_balance - data.amount
+        new_to_balance = to_balance + data.amount
+
+        cur.execute(
+            "UPDATE accounts SET balance = %s WHERE id = %s",
+            (new_from_balance, data.from_account_id)
+        )
+
+        cur.execute(
+            "UPDATE accounts SET balance = %s WHERE id = %s",
+            (new_to_balance, data.to_account_id)
+        )
+
+        conn.commit()
 
         return {
-            "account_id": row[0],
-            "user_id": row[1],
-            "currency": row[2],
-            "balance": str(row[3])
+            "status": "success",
+            "from_account_new_balance": str(new_from_balance),
+            "to_account_new_balance": str(new_to_balance)
         }
+
+    except Exception as e:
+        conn.rollback()
+        raise e
 
     finally:
         cur.close()
         conn.close()
 
 
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
+# ---------- Get Balance ----------
 
-
-@app.get("/ready")
-def readiness():
+@app.get("/balance/{account_id}")
+def get_balance(account_id: int):
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT 1;")
+
+        cur.execute(
+            "SELECT balance FROM accounts WHERE id = %s",
+            (account_id,)
+        )
+
+        row = cur.fetchone()
+
         cur.close()
         conn.close()
-        return {"status": "ready"}
-    except Exception:
-        return {"status": "not_ready"}
 
+        if not row:
+            raise HTTPException(status_code=404, detail="Account not found")
+
+        return {"balance": str(row[0])}
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Balance fetch failed: {e}")
+        raise HTTPException(status_code=500, detail="Balance retrieval failed")
